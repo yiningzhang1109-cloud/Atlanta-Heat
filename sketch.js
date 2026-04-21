@@ -1,3 +1,8 @@
+// ============================================================
+// ATLANTA HEAT FAN — v4 (Merged)
+// 音频 + 状态机三步引导 + Ending + 调淡故事背景 + 侧边图片
+// ============================================================
+
 const CANVAS_W = 3072;
 const CANVAS_H = 1280;
 const COLS = 5;
@@ -12,12 +17,39 @@ let scaleFactor = 0.4;
 const SCALE_STEP = 0.05;
 
 const CELL_STABILITY = 10;
+
+// ── 三档配色 ─────────────────────────────────────────────────
 const MINIMAL = { bg: "#EAEAEA", fan: "#FF3366", jacksNeeded: 5  };
 const MEDIUM   = { bg: "#FF9F1C", fan: "#1C6EFF", jacksNeeded: 10 };
 const HIGH     = { bg: "#E63946", fan: "#36E6D9", jacksNeeded: 20 };
 
+// ── 状态机 ───────────────────────────────────────────────────
+// 'calibration' → 'running' → 'completed' → 'calibration'
+let appState = 'calibration';
+
+// 标定三步状态（顺序激活，同时显示）
+// step 0: 等待有人进入格子（鼻子检测到 cell）
+// step 1: 提示做开合跳
+// step 2: 完成第一个开合跳 → 进入 running
+let calibStep = 0;
+// 标定阶段检测到的 cell（用于显示"进入了格子"）
+let calibDetectedCell = null;
+// 标定阶段的开合跳状态（单人即可）
+let calibArmsUp = false;
+
+// Ending
+const COMPLETION_DISPLAY_MS = 15000;
+let completionTime = 0;
+
+// ── 音频 ─────────────────────────────────────────────────────
 let sounds = {};
 
+// ── 故事版调淡背景（lerp 向白 65%）──────────────────────────
+function getTintedBg(tier) {
+  return lerpColor(color(tier.bg), color(255, 255, 255), 0.65);
+}
+
+// ── 故事内容 ─────────────────────────────────────────────────
 const transcripts = {
   "OAKCLIFF": {
     context: "New resident calling a friend · Est. 15 seconds",
@@ -137,6 +169,25 @@ const transcripts = {
   }
 };
 
+const audioDurations = {
+  "BANKHEAD":      15000,
+  "CASCADE RD":    15000,
+  "EAST ATLANTA":  13000,
+  "ENGLISH AVE":   13000,
+  "GEORGIA TECH":  15000,
+  "GREENBRIAR":    18000,
+  "KINGS FOREST":  10000,
+  "KIRKWOOD":      18000,
+  "LINDRIDGE":     12000,
+  "MT. PARAN":      6000,
+  "OAKCLIFF":      10000,
+  "ORMEWOOD PK":    9000,
+  "PITTSBURGH":    18000,
+  "PLEASANT HILL": 10000,
+  "WASHINGTON PK": 13000,
+};
+
+// ── 邻居数据 ─────────────────────────────────────────────────
 const neighborhoods = [
   { name: "MT. PARAN",     col: 0, row: 0, tier: MEDIUM  },
   { name: "PLEASANT HILL", col: 1, row: 0, tier: MINIMAL },
@@ -172,30 +223,26 @@ let fullscreenCell = null;
 let completionQueue = [];
 let pg;
 
-// ── 状态机 ───────────────────────────────────────────────────
-let appState = 'calibration'; // 'calibration' | 'running' | 'completed'
-let completionTime = 0;
-const COMPLETION_DISPLAY_MS = 15000;
-
-// ── 标定状态 ─────────────────────────────────────────────────
+// 侧边图片
 let imgJump, imgJumpingJack;
-let calibStep = 0;          // 0 = 等待入场, 1 = 等待手腕可见, 2 = 等待开合跳
-let calibArmsUp = false;
-let calibCellBufferCount = 0;
-let figT = 0;               // 动画人形的插值 0→1→0
-let figDir = 1;
 
-// ── 摄像头就绪标志 ───────────────────────────────────────────
-let videoReady = false;
+// ── 骨架连接 ─────────────────────────────────────────────────
+const SKELETON_CONNECTIONS = [
+  ["left_shoulder","right_shoulder"],
+  ["left_shoulder","left_elbow"],   ["left_elbow","left_wrist"],
+  ["right_shoulder","right_elbow"], ["right_elbow","right_wrist"],
+  ["left_shoulder","left_hip"],     ["right_shoulder","right_hip"],
+  ["left_hip","right_hip"],
+  ["left_hip","left_knee"],         ["left_knee","left_ankle"],
+  ["right_hip","right_knee"],       ["right_knee","right_ankle"],
+];
 
 // ============================================================
 // PRELOAD
 // ============================================================
 function preload() {
-  // 图片加载失败时静默降级，不崩溃
   imgJump        = loadImage('jump.png',         () => {}, () => { imgJump = null; });
-  imgJumpingJack = loadImage('jumping_Jack.png', () => {}, () => { imgJumpingJack = null; });
-
+  imgJumpingJack = loadImage('jumping jack.png', () => {}, () => { imgJumpingJack = null; });
   for (let key in transcripts) {
     let t = transcripts[key];
     sounds[key] = loadSound("Phonecalls/" + t.audio + ".mp3");
@@ -210,11 +257,9 @@ function setup() {
   pg = createGraphics(CANVAS_W, CANVAS_H);
   cellW = CANVAS_W / COLS;
   cellH = CANVAS_H / ROWS;
-
-  video = createCapture(VIDEO, () => { videoReady = true; });
-  video.size(640, 480);
+  video = createCapture(VIDEO);
+  video.size(CANVAS_W, CANVAS_H);
   video.hide();
-
   bodyPose = ml5.bodyPose("MoveNet", { flipped: true, multiPose: true }, modelReady);
   textFont("Arial");
   pg.textFont("Arial");
@@ -240,12 +285,9 @@ function getCell(x, y) {
 
 function getKeypoints(pose) {
   let kps = {};
-  // 安全读取摄像头分辨率，避免除以零
-  let vw = (video && video.width  > 0) ? video.width  : 640;
-  let vh = (video && video.height > 0) ? video.height : 480;
   for (let kp of pose.keypoints) {
-    let x = kp.x * (CANVAS_W / vw);
-    let y = kp.y * (CANVAS_H / vh);
+    let x = kp.x * (CANVAS_W / video.width);
+    let y = kp.y * (CANVAS_H / video.height);
     kps[kp.name] = { x, y, confidence: kp.confidence || kp.score };
   }
   return kps;
@@ -260,7 +302,7 @@ function draw() {
   if (appState === 'calibration') {
     drawCalibrationScreen();
   } else if (appState === 'completed') {
-    drawEndingScreen();
+    drawCompletionScreen();
   } else {
     drawRunningScreen();
   }
@@ -270,133 +312,167 @@ function draw() {
 }
 
 // ============================================================
-// CALIBRATION SCREEN
+// CALIBRATION SCREEN — 三步顺序激活
 // ============================================================
 function drawCalibrationScreen() {
-  pg.background(20);
-
-  // ── 守卫：摄像头未就绪时只显示纯色背景，不尝试渲染视频 ──
-  if (!videoReady || !video || video.width <= 0 || video.height <= 0) {
-    pg.fill(255, 120, 0, 60);
+  // 深色热浪渐变背景
+  for (let i = 0; i < 20; i++) {
+    let t = i / 20;
+    let c = lerpColor(color(12, 10, 8), color(60, 18, 8), t);
     pg.noStroke();
-    pg.textAlign(CENTER, CENTER);
-    pg.textStyle(BOLD);
-    pg.textSize(CANVAS_H * 0.04);
-    pg.fill(200, 200, 200);
-    pg.text("Initializing camera...", CANVAS_W / 2, CANVAS_H / 2);
-    return;
+    pg.fill(red(c), green(c), blue(c));
+    pg.rect(0, t * CANVAS_H, CANVAS_W, CANVAS_H / 20 + 1);
   }
 
-  // ── 摄像头背景（镜像）────────────────────────────────────
-  let vRatio = video.width  / video.height;
-  let cRatio = CANVAS_W / CANVAS_H;
-  let drawW, drawH, drawX2, drawY2;
-  if (vRatio > cRatio) {
-    drawH = CANVAS_H; drawW = drawH * vRatio;
-  } else {
-    drawW = CANVAS_W; drawH = drawW / vRatio;
-  }
-  drawX2 = (CANVAS_W - drawW) / 2;
-  drawY2 = (CANVAS_H - drawH) / 2;
-
-  pg.push();
-  pg.translate(CANVAS_W, 0);
-  pg.scale(-1, 1);
-  pg.tint(255, 140); // 半透明摄像头画面
-  pg.image(video, -drawX2 - drawW + CANVAS_W, drawY2, drawW, drawH);
-  pg.noTint();
-  pg.pop();
-
-  // ── 侧边图片 ─────────────────────────────────────────────
+  // 侧边图片
+  let imgW   = CANVAS_W * 0.42;
+  let imgPad = CANVAS_W * 0.015;
   if (imgJump) {
-    let imgH = CANVAS_H * 0.48;
-    let imgW = imgJump.width * (imgH / imgJump.height);
-    pg.image(imgJump, CANVAS_W * 0.01, (CANVAS_H - imgH) / 2 - CANVAS_H * 0.04, imgW, imgH);
+    let ih = imgJump.height * (imgW / imgJump.width);
+    pg.image(imgJump, imgPad, CANVAS_H / 2 - ih / 2, imgW, ih);
   }
   if (imgJumpingJack) {
-    let imgH = CANVAS_H * 0.48;
-    let imgW = imgJumpingJack.width * (imgH / imgJumpingJack.height);
-    pg.image(imgJumpingJack,
-      CANVAS_W - CANVAS_W * 0.01 - imgW,
-      (CANVAS_H - imgH) / 2 - CANVAS_H * 0.04,
-      imgW, imgH);
+    let ih = imgJumpingJack.height * (imgW / imgJumpingJack.width);
+    pg.image(imgJumpingJack, CANVAS_W - imgPad - imgW, CANVAS_H / 2 - ih / 2, imgW, ih);
   }
 
-  // ── 骨架（所有检测到的人）────────────────────────────────
-  for (let i = 0; i < poses.length; i++) {
-    let kps = getKeypoints(poses[i]);
-    drawShadow(kps, null);
-    if (i === 0) updateCalibStep(kps); // 只用第一个人推进标定步骤
+  // 骨架（检测到的所有人）
+  for (let pose of poses) {
+    let kps  = getKeypoints(pose);
+    let tier = getCalibTier(kps);
+    drawSketchSkeleton(kps, tier);
   }
 
-  // ── 动画人形插值 ─────────────────────────────────────────
-  figT += 0.025 * figDir;
-  if (figT >= 1) { figT = 1; figDir = -1; }
-  if (figT <= 0) { figT = 0; figDir =  1; }
+  // 更新标定步骤
+  updateCalibStep();
 
-  // ── 三步 HUD ─────────────────────────────────────────────
-  drawCalibHUD();
+  // ── 三步 UI ──────────────────────────────────────────────
+  drawCalibSteps();
+
+  // 脚部参考线
+  drawStandHereLine();
+
+  // 底部说明
+  pg.fill(140, 80, 42);
+  pg.textStyle(NORMAL);
+  pg.textSize(CANVAS_H * 0.022);
+  pg.textAlign(CENTER, BOTTOM);
+  pg.noStroke();
+  pg.text("Do jumping jacks to spin the fans  ·  Reveal Atlanta's heat stories",
+          CANVAS_W / 2, CANVAS_H - 20);
 }
 
-// ── 标定步骤状态更新 ─────────────────────────────────────────
-function updateCalibStep(kps) {
-  let nose = kps["nose"];
-  let lw   = kps["left_wrist"],    rw = kps["right_wrist"];
-  let ls   = kps["left_shoulder"], rs = kps["right_shoulder"];
+// 获取当前标定时某人所在格子颜色（用于骨架着色）
+function getCalibTier(kps) {
+  let nose = kps['nose'];
+  if (!nose || nose.confidence < 0.2) return MINIMAL;
+  let cell = getCell(nose.x, nose.y);
+  return cell ? cell.tier : MINIMAL;
+}
 
-  // Step 0 → 1：鼻子稳定出现在画面中（防止误触发）
-  if (calibStep === 0) {
-    if (nose && nose.confidence > 0.2) {
-      calibCellBufferCount++;
-      if (calibCellBufferCount >= CELL_STABILITY) calibStep = 1;
-    } else {
-      calibCellBufferCount = 0;
+// 骨架绘制（sketch 风格：黑色粗线 + 鼻子脉冲光晕）
+function drawSketchSkeleton(kps, tier) {
+  let fc = color(tier ? tier.fan : "#FF3366");
+
+  pg.stroke(0, 0, 0, 180);
+  pg.strokeWeight(18);
+  pg.strokeCap(ROUND);
+  for (let [a, b] of SKELETON_CONNECTIONS) {
+    if (kps[a] && kps[b] && kps[a].confidence > 0.2 && kps[b].confidence > 0.2) {
+      pg.line(kps[a].x, kps[a].y, kps[b].x, kps[b].y);
     }
   }
 
-  // Step 1 → 2：双手腕置信度达标（手臂可见）
-  if (calibStep === 1) {
-    if (lw && rw && ls && rs &&
-        lw.confidence > 0.3 && rw.confidence > 0.3 &&
-        ls.confidence > 0.3 && rs.confidence > 0.3) {
-      calibStep = 2;
-    }
+  if (kps['nose'] && kps['nose'].confidence > 0.2) {
+    let hx    = kps['nose'].x;
+    let hy    = kps['nose'].y;
+    let pulse = sin(pulseT) * 0.5 + 0.5;
+    pg.noStroke();
+    pg.fill(red(fc), green(fc), blue(fc), 40 + pulse * 30); pg.circle(hx, hy, 160);
+    pg.fill(red(fc), green(fc), blue(fc), 80 + pulse * 40); pg.circle(hx, hy, 110);
+    pg.fill(red(fc), green(fc), blue(fc), 255);             pg.circle(hx, hy, 70);
+    pg.fill(255, 255, 255, 180);                            pg.circle(hx, hy, 36);
+    pg.fill(255, 255, 255, 255);                            pg.circle(hx, hy, 14);
   }
+}
 
-  // Step 2：完成一个完整开合跳 → 进入 running
-  if (calibStep === 2) {
-    let allValid = lw && rw && ls && rs &&
-      lw.confidence > 0.2 && rw.confidence > 0.2 &&
-      ls.confidence > 0.2 && rs.confidence > 0.2;
-    if (allValid) {
-      let bothUp = lw.y < ls.y && rw.y < rs.y;
-      if (bothUp && !calibArmsUp) {
-        calibArmsUp = true;
-      } else if (!bothUp && calibArmsUp) {
-        calibArmsUp = false;
-        // 首次用户交互后激活 Audio Context，解决浏览器自动播放限制
-        userStartAudio();
-        appState = 'running';
+/**
+ * 三步顺序激活逻辑：
+ * calibStep 0 → 检测到鼻子进入任意格子 → 升至 1
+ * calibStep 1 → 检测到双手举起（准备开合跳）→ 升至 2
+ * calibStep 2 → 完成一个完整开合跳 → 进入 running
+ */
+function updateCalibStep() {
+  if (poses.length === 0) return;
+
+  for (let pose of poses) {
+    let kps  = getKeypoints(pose);
+    let nose = kps['nose'];
+    let lw   = kps['left_wrist'],  rw  = kps['right_wrist'];
+    let ls   = kps['left_shoulder'], rs = kps['right_shoulder'];
+
+    // Step 0 → 1：检测到鼻子进入格子
+    if (calibStep === 0) {
+      if (nose && nose.confidence > 0.2) {
+        let cell = getCell(nose.x, nose.y);
+        if (cell) {
+          calibDetectedCell = cell;
+          calibStep = 1;
+        }
+      }
+    }
+
+    // Step 1 → 2：双手腕可见且置信度足够
+    if (calibStep === 1) {
+      if (lw && rw && ls && rs &&
+          lw.confidence > 0.3 && rw.confidence > 0.3 &&
+          ls.confidence > 0.3 && rs.confidence > 0.3) {
+        calibStep = 2;
+      }
+    }
+
+    // Step 2：检测完整开合跳（双手举过肩 → 放下）
+    if (calibStep === 2) {
+      let allValid = lw && rw && ls && rs &&
+        lw.confidence > 0.2 && rw.confidence > 0.2 &&
+        ls.confidence > 0.2 && rs.confidence > 0.2;
+      if (allValid) {
+        let bothUp = lw.y < ls.y && rw.y < rs.y;
+        if (bothUp && !calibArmsUp) {
+          calibArmsUp = true;
+        } else if (!bothUp && calibArmsUp) {
+          // 完成一次开合跳 → 进入 running
+          calibArmsUp = false;
+          appState    = 'running';
+          return;
+        }
       }
     }
   }
 }
 
-// ── 三步 HUD（同时显示，顺序激活）───────────────────────────
-function drawCalibHUD() {
+// 动画人形插值变量
+let figT = 0;
+let figDir = 1;
+
+// 三步 HUD（队友动画版）
+function drawCalibSteps() {
   let pillH  = CANVAS_H * 0.10;
-  let hudY   = CANVAS_H - pillH - CANVAS_H * 0.04;
+  let hudY   = CANVAS_H * 0.72;
   let pad    = CANVAS_W * 0.016;
   let gap    = CANVAS_W * 0.008;
   let arrowW = CANVAS_W * 0.012;
+  let figW   = pillH * 1.1;
 
+  // 动画人形插值推进
+  figT += 0.025 * figDir;
+  if (figT >= 1) { figT = 1; figDir = -1; }
+  if (figT <= 0) { figT = 0; figDir =  1; }
   let ease = figT < 0.5 ? 2 * figT * figT : -1 + (4 - 2 * figT) * figT;
 
   pg.textSize(pillH * 0.28);
   pg.textStyle(BOLD);
   pg.noStroke();
-
-  let figW = pillH * 1.1;
 
   let p1a = "STEP INTO A NEIGHBORHOOD ";
   let p1b = "HEAD FIRST";
@@ -453,7 +529,7 @@ function drawCalibHUD() {
     pg.rect(p2X, hudY, p2W, pillH, pillH / 2);
   }
   pg.noStroke();
-  // 人形动画图标
+  // 动画人形图标
   drawCalibFigure(p2X + pad * 0.4, hudY + pillH * 0.05, pillH * 0.9, ease, p2Active);
   let p2TextX = p2X + pad * 0.4 + figW + gap * 0.2;
   pg.textAlign(LEFT, CENTER);
@@ -484,7 +560,7 @@ function drawCalibHUD() {
   pg.text(p3text, p3X + pad, cy);
 }
 
-// ── 动画人形（开合跳姿势，带脉冲光晕）─────────────────────────
+// 动画人形（开合跳姿势，带脉冲光晕）
 function drawCalibFigure(x, y, size, ease, active) {
   let cx        = x + size * 0.5;
   let headY     = y + size * 0.08;
@@ -495,7 +571,6 @@ function drawCalibFigure(x, y, size, ease, active) {
   let pulse     = sin(pulseT) * 0.5 + 0.5;
   let fc        = active ? color(255, 120, 0) : color(70, 70, 70);
 
-  // 头部发光
   pg.noStroke();
   pg.fill(red(fc), green(fc), blue(fc), 40 + pulse * 30); pg.circle(cx, headY, size * 0.32);
   pg.fill(red(fc), green(fc), blue(fc), 80 + pulse * 40); pg.circle(cx, headY, size * 0.24);
@@ -505,23 +580,34 @@ function drawCalibFigure(x, y, size, ease, active) {
 
   pg.stroke(red(fc), green(fc), blue(fc), 220);
   pg.strokeCap(ROUND);
-
-  // 躯干
   pg.strokeWeight(size * 0.09);
   pg.line(cx, shoulderY, cx, hipY);
 
-  // 手臂（开合跳动画）
   let armLen = size * 0.3;
   pg.strokeWeight(size * 0.08);
   pg.line(cx, shoulderY, cx - sin(armAngle) * armLen * 0.6, shoulderY + cos(armAngle) * armLen);
   pg.line(cx, shoulderY, cx + sin(armAngle) * armLen * 0.6, shoulderY + cos(armAngle) * armLen);
 
-  // 腿（开合跳动画）
   let legLen = size * 0.38;
   pg.line(cx, hipY, cx - sin(legSpread) * legLen * 0.8, hipY + cos(legSpread) * legLen);
   pg.line(cx, hipY, cx + sin(legSpread) * legLen * 0.8, hipY + cos(legSpread) * legLen);
-
   pg.noStroke();
+}
+
+function drawStandHereLine() {
+  let pulse  = sin(pulseT) * 0.5 + 0.5;
+  let lineY  = CANVAS_H * 0.90;
+  let lineX1 = CANVAS_W * 0.20;
+  let lineX2 = CANVAS_W * 0.80;
+
+  pg.stroke(255, 160, 40, lerp(25, 55, pulse));   pg.strokeWeight(28); pg.line(lineX1, lineY, lineX2, lineY);
+  pg.stroke(255, 170, 60, lerp(60, 120, pulse));  pg.strokeWeight(10); pg.line(lineX1, lineY, lineX2, lineY);
+  pg.stroke(255, 200, 100, lerp(180, 255, pulse)); pg.strokeWeight(3);  pg.line(lineX1, lineY, lineX2, lineY);
+  pg.noStroke();
+  pg.fill(255, 200, 100, lerp(180, 255, pulse));
+  pg.textAlign(CENTER, BOTTOM); pg.textStyle(BOLD); pg.textSize(CANVAS_H * 0.034);
+  pg.text('▼  STAND HERE  ▼', CANVAS_W / 2, lineY - 16);
+  pg.textAlign(LEFT, TOP); pg.textStyle(NORMAL);
 }
 
 // ============================================================
@@ -547,10 +633,7 @@ function drawRunningScreen() {
     for (let i = 0; i < poses.length; i++) {
       let kps = getKeypoints(poses[i]);
       if (!personStates[i]) {
-        personStates[i] = {
-          armsUp: false, currentCell: null,
-          cellBuffer: null, cellBufferCount: 0,
-        };
+        personStates[i] = { armsUp: false, currentCell: null, cellBuffer: null, cellBufferCount: 0 };
       }
       drawShadow(kps, personStates[i]);
       detectCell(kps, personStates[i]);
@@ -562,45 +645,15 @@ function drawRunningScreen() {
 }
 
 // ============================================================
-// SKELETON / SHADOW
+// SHADOW（运行中骨架，复用 drawSketchSkeleton）
 // ============================================================
 function drawShadow(kps, ps) {
-  let connections = [
-    ["left_shoulder","right_shoulder"], ["left_shoulder","left_elbow"],
-    ["left_elbow","left_wrist"],        ["right_shoulder","right_elbow"],
-    ["right_elbow","right_wrist"],      ["left_shoulder","left_hip"],
-    ["right_shoulder","right_hip"],     ["left_hip","right_hip"],
-    ["left_hip","left_knee"],           ["left_knee","left_ankle"],
-    ["right_hip","right_knee"],         ["right_knee","right_ankle"],
-  ];
-
-  pg.stroke(0, 0, 0, 180);
-  pg.strokeWeight(18);
-  pg.strokeCap(ROUND);
-  for (let [a, b] of connections) {
-    if (kps[a] && kps[b] && kps[a].confidence > 0.2 && kps[b].confidence > 0.2) {
-      pg.line(kps[a].x, kps[a].y, kps[b].x, kps[b].y);
-    }
-  }
-
-  if (kps["nose"] && kps["nose"].confidence > 0.2) {
-    let hx    = kps["nose"].x;
-    let hy    = kps["nose"].y;
-    let pulse = sin(pulseT) * 0.5 + 0.5;
-    let orbColor = (ps && ps.currentCell) ? ps.currentCell.tier.fan : "#FF3366";
-    let oc = color(orbColor);
-
-    pg.noStroke();
-    pg.fill(red(oc), green(oc), blue(oc), 40 + pulse * 30); pg.circle(hx, hy, 160);
-    pg.fill(red(oc), green(oc), blue(oc), 80 + pulse * 40); pg.circle(hx, hy, 110);
-    pg.fill(red(oc), green(oc), blue(oc), 255);             pg.circle(hx, hy, 70);
-    pg.fill(255, 255, 255, 180);                            pg.circle(hx, hy, 36);
-    pg.fill(255, 255, 255, 255);                            pg.circle(hx, hy, 14);
-  }
+  let tier = ps.currentCell ? ps.currentCell.tier : MINIMAL;
+  drawSketchSkeleton(kps, tier);
 }
 
 // ============================================================
-// CELL & JACK DETECTION
+// CELL & JUMPING JACK DETECTION
 // ============================================================
 function detectCell(kps, ps) {
   let nose = kps["nose"];
@@ -626,7 +679,7 @@ function detectJumpingJack(kps, ps) {
   let s = cellStates[ps.currentCell.name];
   if (s.done) return;
 
-  let lw = kps["left_wrist"],    rw = kps["right_wrist"];
+  let lw = kps["left_wrist"],  rw = kps["right_wrist"];
   let ls = kps["left_shoulder"], rs = kps["right_shoulder"];
   let allValid = lw && rw && ls && rs &&
     lw.confidence > 0.2 && rw.confidence > 0.2 &&
@@ -656,27 +709,9 @@ function queueCompletion(n) {
   if (!fullscreenCell) playNextCompletion();
 }
 
-const audioDurations = {
-  "BANKHEAD":      15000,
-  "CASCADE RD":    15000,
-  "EAST ATLANTA":  13000,
-  "ENGLISH AVE":   13000,
-  "GEORGIA TECH":  15000,
-  "GREENBRIAR":    18000,
-  "KINGS FOREST":  10000,
-  "KIRKWOOD":      18000,
-  "LINDRIDGE":     12000,
-  "MT. PARAN":      6000,
-  "OAKCLIFF":      10000,
-  "ORMEWOOD PK":    9000,
-  "PITTSBURGH":    18000,
-  "PLEASANT HILL": 10000,
-  "WASHINGTON PK": 13000,
-};
-
 function playNextCompletion() {
   if (completionQueue.length === 0) {
-    // 全部完成 → 进入 ending
+    // 队列空 → 检查是否全部完成
     if (neighborhoods.every(n => cellStates[n.name].done)) {
       completionTime = millis();
       appState = 'completed';
@@ -709,7 +744,7 @@ function playNextCompletion() {
     s.transcriptTimers.push(t);
   });
 
-  let audioDur    = audioDurations[n.name] || 15000;
+  let audioDur   = audioDurations[n.name] || 15000;
   let shrinkDelay = expandDuration + audioDur;
 
   setTimeout(() => { s.expanding = false; s.shrinking = true; }, shrinkDelay);
@@ -724,7 +759,7 @@ function playNextCompletion() {
 }
 
 // ============================================================
-// FULLSCREEN STORY
+// FULLSCREEN STORY — 调淡背景色
 // ============================================================
 function drawFullscreen(n) {
   let s = cellStates[n.name];
@@ -738,7 +773,9 @@ function drawFullscreen(n) {
   let rw = lerp(cellW, CANVAS_W, t);
   let rh = lerp(cellH, CANVAS_H, t);
 
-  pg.fill(n.tier.bg);
+  // 调淡背景色
+  let tintedBg = getTintedBg(n.tier);
+  pg.fill(red(tintedBg), green(tintedBg), blue(tintedBg));
   pg.noStroke();
   pg.rect(rx, ry, rw, rh);
 
@@ -766,32 +803,31 @@ function drawFullscreen(n) {
     }
     let startY = headerH + max(0, (CANVAS_H - headerH - totalH) / 2) * 0.6;
 
-    pg.fill(0, 0, 0, alpha * 0.4);
-    pg.noStroke();
-    pg.textAlign(LEFT, TOP);
-    pg.textStyle(BOLD);
+    // 区域名（fan 色，对比淡背景）
+    let fanC = color(n.tier.fan);
+    pg.fill(red(fanC), green(fanC), blue(fanC), alpha);
+    pg.noStroke(); pg.textAlign(LEFT, TOP); pg.textStyle(BOLD);
     pg.textSize(CANVAS_H * 0.06);
     pg.text(n.name, padX, CANVAS_H * 0.06);
 
-    pg.textStyle(NORMAL);
-    pg.textSize(CANVAS_H * 0.032);
-    pg.fill(0, 0, 0, alpha * 0.3);
+    // context
+    pg.fill(40, 40, 40, alpha * 0.55);
+    pg.textStyle(NORMAL); pg.textSize(CANVAS_H * 0.032);
     pg.text(tr.context, padX, CANVAS_H * 0.14);
 
     let yPos = startY;
     for (let i = 0; i < tr.lines.length; i++) {
       let la = s.lineAlphas[i];
-      pg.fill(20, 20, 20, la);
-      pg.textStyle(BOLD);
-      pg.textSize(CANVAS_H * 0.032);
-      pg.textAlign(LEFT, TOP);
+
+      // speaker
+      pg.fill(red(fanC), green(fanC), blue(fanC), la * 0.9);
+      pg.textStyle(BOLD); pg.textSize(CANVAS_H * 0.032); pg.textAlign(LEFT, TOP);
       pg.text(tr.lines[i].speaker, padX, yPos);
       yPos += speakerH;
 
+      // 台词
       pg.fill(20, 20, 20, la);
-      pg.textStyle(NORMAL);
-      pg.textSize(tSize);
-      pg.textWrap(WORD);
+      pg.textStyle(NORMAL); pg.textSize(tSize); pg.textWrap(WORD);
       pg.text(tr.lines[i].text, padX, yPos, CANVAS_W * 0.8);
 
       let wraps = max(0, floor(tr.lines[i].text.length / 80));
@@ -802,9 +838,9 @@ function drawFullscreen(n) {
 }
 
 // ============================================================
-// ENDING SCREEN
+// COMPLETION / ENDING SCREEN
 // ============================================================
-function drawEndingScreen() {
+function drawCompletionScreen() {
   let elapsed = millis() - completionTime;
   pg.background(10);
 
@@ -852,7 +888,7 @@ function drawEndingScreen() {
           CANVAS_W / 2 + lineLen, CANVAS_H / 2 - CANVAS_H * 0.02);
   pg.noStroke();
 
-  // 核心问句（白色 + "burn?" 用红色）
+  // 核心问句（"burn?" 单独红色）
   let qAlpha  = constrain(map(elapsed, 800, 3000, 0, 255), 0, 255);
   let lineY1  = CANVAS_H / 2 + CANVAS_H * 0.08;
   let lineY2  = CANVAS_H / 2 + CANVAS_H * 0.175;
@@ -868,17 +904,16 @@ function drawEndingScreen() {
   pg.textAlign(CENTER, CENTER);
   pg.text(line1, CANVAS_W / 2, lineY1);
 
-  // "burn?" 单独用红色渲染
   pg.textAlign(LEFT, CENTER);
-  let line2aW    = pg.textWidth(line2a);
-  let line2bW    = pg.textWidth(line2b);
+  let line2aW     = pg.textWidth(line2a);
+  let line2bW     = pg.textWidth(line2b);
   let line2StartX = CANVAS_W / 2 - (line2aW + line2bW) / 2;
   pg.fill(255, 255, 255, qAlpha);
   pg.text(line2a, line2StartX, lineY2);
   pg.fill(230, 57, 70, qAlpha);
   pg.text(line2b, line2StartX + line2aW, lineY2);
 
-  // 倒计时提示（最后 5 秒）
+  // 倒计時（最後 5 秒）
   if (elapsed > COMPLETION_DISPLAY_MS - 5000) {
     let ctAlpha   = constrain(map(elapsed, COMPLETION_DISPLAY_MS - 5000, COMPLETION_DISPLAY_MS - 3000, 0, 120), 0, 120);
     let remaining = max(0, ceil((COMPLETION_DISPLAY_MS - elapsed) / 1000));
@@ -904,15 +939,15 @@ function resetAll() {
       lineAlphas: [],
     };
   }
-  personStates         = {};
-  fullscreenCell       = null;
-  completionQueue      = [];
-  calibStep            = 0;
-  calibArmsUp          = false;
-  calibCellBufferCount = 0;
-  figT                 = 0;
-  figDir               = 1;
-  appState             = 'calibration';
+  personStates    = {};
+  fullscreenCell  = null;
+  completionQueue = [];
+  calibStep       = 0;
+  calibDetectedCell = null;
+  calibArmsUp     = false;
+  figT            = 0;
+  figDir          = 1;
+  appState        = 'calibration';
 }
 
 // ============================================================
